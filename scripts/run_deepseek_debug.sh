@@ -17,8 +17,30 @@ set -ex
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 NGPU=${NGPU:-1}
-STEPS=${STEPS:-10}
+STEPS=${STEPS:-50}
 OUTPUT=${OUTPUT:-"./outputs/deepseek_debug"}
+
+# The deepseek_v4_debugmodel config defaults to a 16384 context folded x8 into a
+# ~131072 token microbatch stream, and deepseek_v4/attention.py::_build_block_mask
+# materializes a dense [1, stream_len, stream_len] mask (O(n^2), ~64GiB at the
+# default). Shrink the per-microbatch token budget and context so the smoke test
+# fits on a single commodity GPU. Override with SEQ_LEN=... for a larger run.
+SEQ_LEN=${SEQ_LEN:-8192}
+
+# CUDA graph capture is on by default, but the standard MoE token dispatcher
+# (LocalTokenDispatcher, expert_parallel_degree=1) does a CPU<->CUDA copy inside
+# torch._grouped_mm that is illegal during capture, and Trainer._validate_cuda_graphs
+# does not catch it when expert_parallel_degree == 1. Disable graphs by default;
+# set CUDA_GRAPHS=1 to opt back in (requires a graph-safe EP configuration).
+CUDA_GRAPHS=${CUDA_GRAPHS:-0}
+
+EXTRA_ARGS=(
+    --training.num_tokens_per_microbatch_per_dp_rank "${SEQ_LEN}"
+    --training.max_context_length "${SEQ_LEN}"
+)
+if [ "${CUDA_GRAPHS}" = "0" ]; then
+    EXTRA_ARGS+=(--training.disable_cuda_graphs)
+fi
 
 # Windows PyTorch builds are typically compiled without libuv support, which
 # makes torchrun's default TCPStore backend fail at rendezvous. Fall back to
@@ -32,5 +54,6 @@ MODULE="deepseek_v4" \
 CONFIG="deepseek_v4_debugmodel" \
 ./run_train.sh \
     --training.steps "${STEPS}" \
+    "${EXTRA_ARGS[@]}" \
     --dump_folder "${OUTPUT}" \
     "$@"
