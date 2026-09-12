@@ -3,7 +3,7 @@
 > 本文是 [`distributed-training-roadmap.md`](./distributed-training-roadmap.md) 第 1 周内容的展开讲解。
 > 前置知识：[第 0 周：分布式训练基础](./week0-distributed-fundamentals.md)（三堵墙、collective 通信原语、显存估算）。
 > 目标：搞懂 DDP、ZeRO、FSDP2、HSDP 之间"一脉相承"的关系——它们都在回答同一个问题："显存墙"里的参数/梯度/优化器状态，到底该不该切、怎么切。
-> 示例模型统一用仓库自带的 `deepseek_v4_debugmodel`，配合单卡脚本 [`scripts/run_deepseek_debug.sh`](../scripts/run_deepseek_debug.sh)。
+> 示例模型统一用仓库自带的 `deepseek_v4_debugmodel`，配合 [`scripts/run_deepseek_debug.sh`](../scripts/run_deepseek_debug.sh) 脚本（默认 `NGPU=2`）。
 
 ---
 
@@ -166,43 +166,49 @@ else:
 
 ## 6. 动手
 
-### 6.1 这个环境的限制，以及怎么绕过去
+### 6.1 这个环境：真双卡（2x RTX A4000）
 
-当前开发机是**单卡**（`RTX 5060 Ti, 16GB`）。roadmap 里 `NGPU=4` 的例子在这台机器上**跑不起来**（`torchrun --nproc_per_node=4` 会尝试用 4 个进程抢同一张物理 GPU 并各自走 NCCL，正常会失败或行为不可信）。如果你有多卡机器，直接跳到 6.3 节用真实命令；单卡环境下可以做的是：
+当前开发机是**真实双卡**（2x `NVIDIA RTX A4000`，`CUDA capacity` 日志里报的可用显存是 `14.62GiB`/卡）。这意味着 6.2/6.3 节里 `NGPU=2` 的例子**都是真实多进程 + NCCL 跑出来的**，不需要 `COMM_MODE=fake_backend` 兜底。
 
-**用 `COMM_MODE=fake_backend`（[`docs/debugging.md`](../docs/debugging.md) "Fake Backend Debugging" 一节）在单卡上验证任意 `NGPU` 的并行配置**——它用假的 process group 模拟通信（不做真实的跨卡数据搬运），只在单卡、单进程、不需要 `torchrun`/NCCL 初始化的情况下，把 mesh 构建、模型分片、rank-0 的训练循环逻辑完整跑一遍。**局限**：不能用来测真实吞吐/延迟（通信是假的，测不出真实开销），也不能验证依赖真实数据交换正确性的逻辑；但验证"mesh 建对了没"、"FSDP/HSDP 有没有生效"、"显存分片有没有生效"完全够用。
+**但只有 2 张卡，仍有一个硬限制**：任何需要 `dp_replicate x dp_shard > 2` 的配置（比如 `dp_shard=4`，或者两个维度都非 1 的"完整"HSDP，如 `dp_replicate=2 x dp_shard=2` 需要 4 个 rank）在这台机器上没法用真实进程跑满。想验证这类超过 2 rank 的配置，仍然要用 `COMM_MODE=fake_backend`（[`docs/debugging.md`](../docs/debugging.md) "Fake Backend Debugging" 一节）——它用假的 process group 模拟通信，能在少数物理卡上"跑"任意 `NGPU`，但测不出真实吞吐/延迟。本节只用真实的 2 rank 跑，不再需要这个兜底。
 
-### 6.2 实测：`dp_shard` 度如何影响单 rank 显存
+### 6.2 实测（真实双卡）：`dp_shard` 度如何影响单 rank 显存
 
 ```bash
-for shard in 1 2 4 8; do
-  NGPU=$shard COMM_MODE=fake_backend MODULE=deepseek_v4 CONFIG=deepseek_v4_debugmodel ./run_train.sh \
-    --parallelism.data_parallel_shard_degree $shard \
-    --training.num_tokens_per_microbatch_per_dp_rank 4096 \
-    --training.max_context_length 4096 \
-    --training.disable_cuda_graphs
-done
+# dp_shard=1：单卡，无 FSDP，等价 DDP
+NGPU=1 MODULE=deepseek_v4 CONFIG=deepseek_v4_debugmodel ./run_train.sh \
+  --parallelism.data_parallel_shard_degree 1 \
+  --training.num_tokens_per_microbatch_per_dp_rank 4096 \
+  --training.max_context_length 4096 \
+  --training.disable_cuda_graphs
+
+# dp_shard=2：两张卡各分一半参数/优化器状态
+NGPU=2 MODULE=deepseek_v4 CONFIG=deepseek_v4_debugmodel ./run_train.sh \
+  --parallelism.data_parallel_shard_degree 2 \
+  --training.num_tokens_per_microbatch_per_dp_rank 4096 \
+  --training.max_context_length 4096 \
+  --training.disable_cuda_graphs
 ```
 
-**实测结果**（本机，`deepseek_v4_debugmodel`，10,601,565 参数）：
+**实测结果**（本机 2x RTX A4000，`deepseek_v4_debugmodel`，10,601,565 参数）：
 
 | `dp_shard` | 日志 "Building device mesh" | "CUDA memory usage for model"（分片后的参数+优化器状态显存） |
 |---|---|---|
-| 1（无 FSDP，等价 DDP） | `dp_shard=1` | 0.08 GiB (0.53%) |
-| 2 | `dp_shard=2` | 0.04 GiB (0.29%) |
-| 4 | `dp_shard=4` | 0.03 GiB (0.21%) |
-| 8 | `dp_shard=8` | 0.03 GiB (0.18%) |
+| 1（单卡，无 FSDP，等价 DDP） | `dp_shard=1` | 0.08 GiB (0.56%) |
+| 2（真实双卡 FSDP） | `dp_shard=2` | 0.04 GiB (0.31%) |
 
-**怎么解读**：随 `dp_shard` 翻倍，这部分显存大致减半（1 -> 2 减半明显，之后因为这个 debug 模型只有 10.6M 参数、GiB 显示只保留两位小数，4/8 之间的差异已经小到被舍入抹平，但百分比列仍然看得出持续下降趋势）。这正是 FSDP "参数按 rank 数切分存储" 最直接的证据——**在真实规模的模型上（十亿参数级别），这个降幅会是显存曲线上非常显著的一段，不会像这里一样被固定开销盖住**（回忆第 0 周结论："固定开销远大于模型本身"只在 debug 模型这种极小规模下成立）。
+**怎么解读**：`dp_shard` 从 1 翻倍到 2，模型这部分显存精确减半（0.08 -> 0.04 GiB）——这是 FSDP "参数按 rank 数切分存储" 最直接的证据。因为这个 debug 模型只有 10.6M 参数，这个降幅在总显存里占比很小；**在真实规模的模型上（十亿参数级别），这个降幅会是显存曲线上非常显著的一段**（回忆第 0 周结论："固定开销远大于模型本身"只在 debug 模型这种极小规模下成立）。如果想继续看 `dp_shard=4/8` 的趋势，这台 2 卡机器跑不了真实进程，可以用 6.1 节提到的 `COMM_MODE=fake_backend` 模拟（模式跟本节命令一样，只是把 `NGPU=$shard` 换成任意值、加上 `COMM_MODE=fake_backend`），但拿到的只是 mesh/分片逻辑的验证，不是真实显存或吞吐。
 
-**注意**：`memory: 1.4x GiB` 那一行（step 打印里的总显存）几乎不随 `dp_shard`变化——这是因为这台单卡机器在 fake backend 下所有"rank"共享同一张物理卡，这个总显存里绝大部分是 CUDA context/allocator 的固定开销（第 0 周 1.1 节），不能用来判断 FSDP 效果，**要看的是 "CUDA memory usage for model" 这一行**，它是分片后参数本身的显存占用。
+**注意**：step 打印里的总显存（`memory: x.xxGiB`）不能直接拿来验证 FSDP 效果——里面绝大部分是 CUDA context/allocator 的固定开销（第 0 周 1.1 节），在这个规模的模型上这部分固定开销远大于参数本身。**要看的是 "CUDA memory usage for model" 这一行**，它是分片后参数本身的显存占用，也是上表用的数据来源。
 
-### 6.3 实测：HSDP 的 mesh 构建 + "Applied HSDP" 日志
+### 6.3 实测（真实双卡）：HSDP 的 mesh 构建 + "Applied HSDP" 日志
+
+只有 2 张卡，没法凑出 `dp_replicate=2 x dp_shard=2`（需要 4 个 rank）这种两个维度都非 1 的"完整"HSDP。但用 `dp_replicate=2, dp_shard=1`（两卡互为复制，各自不分片）就能在真实硬件上验证"HSDP 只是 mesh 多了一维"这个结论，且更干净——因为 `dp_shard=1` 时压根没有分片发生：
 
 ```bash
-NGPU=4 COMM_MODE=fake_backend MODULE=deepseek_v4 CONFIG=deepseek_v4_debugmodel ./run_train.sh \
+NGPU=2 MODULE=deepseek_v4 CONFIG=deepseek_v4_debugmodel ./run_train.sh \
   --parallelism.data_parallel_replicate_degree 2 \
-  --parallelism.data_parallel_shard_degree 2 \
+  --parallelism.data_parallel_shard_degree 1 \
   --training.num_tokens_per_microbatch_per_dp_rank 4096 \
   --training.max_context_length 4096 \
   --training.disable_cuda_graphs
@@ -211,32 +217,17 @@ NGPU=4 COMM_MODE=fake_backend MODULE=deepseek_v4 CONFIG=deepseek_v4_debugmodel .
 **实测日志**（对照第 3.3/4 节的代码）：
 
 ```
-Building device mesh with parallelism: pp=1, dp_replicate=2, dp_shard=2, cp=1, tp=1, ep=1
-Successfully created meshes with active dimensions: ['batch', 'loss', 'dp_replicate', 'dp', 'dp_shard']
+Building device mesh with parallelism: pp=1, dp_replicate=2, dp_shard=1, cp=1, tp=1, ep=1
+Successfully created meshes with active dimensions: ['batch', 'loss', 'dp_replicate', 'dp']
 Applied HSDP to the model
-CUDA memory usage for model: 0.04GiB(0.29%)
+CUDA memory usage for model: 0.08GiB(0.56%)
 ```
 
 跟第 4 节的结论对上了两件事：
-1. `"Applied HSDP to the model"` 这条日志确实来自 `fsdp.py` 里 `"dp_replicate" in dp_mesh.mesh_dim_names` 的判断——mesh 名字列表里多了 `dp_replicate` 这一维。
-2. **`CUDA memory usage for model` 是 `0.04GiB`，跟 6.2 节里纯 FSDP `dp_shard=2` 的结果完全一致**——印证了第 4 节的结论："单 rank 显存只取决于 `dp_shard` 宽度，跟 `dp_replicate` 无关"。这里 `dp_replicate=2 x dp_shard=2` 和纯 `dp_shard=2`（`dp_replicate=1`）相比，总卡数翻倍了，但单卡显存分片粒度不变——多出来的卡是拿去做"组间复制换吞吐/容错"，不是拿去"切更细的显存分片"。
+1. `"Applied HSDP to the model"` 这条日志确实来自 `fsdp.py` 里 `"dp_replicate" in dp_mesh.mesh_dim_names` 的判断——即使 `dp_shard=1`（没有实际分片），只要 mesh 里出现了 `dp_replicate` 这一维，就会走 HSDP 分支。另外可以留意一个细节：这里 `active dimensions` 列表里**没有** `dp_shard`（对比 6.2 节 `dp_shard=2` 时列表里有 `dp_shard`）——`dp_shard=1` 这一维在 mesh 里被当作退化维度直接省掉了，`mesh_dim_names` 检查的是 `dp_replicate`，跟 `dp_shard` 是否存在无关。
+2. **`CUDA memory usage for model` 是 `0.08GiB`，跟 6.2 节里 `dp_shard=1` 的结果完全一致（而不是 `dp_shard=2` 的 `0.04GiB`）**——这比之前用 fake backend 测的版本更有说服力：`dp_replicate=2` 让两张卡各自持有一份**完整**参数（互为复制，没有分片），单卡显存跟"不用 FSDP"时一样；印证了第 4 节的结论："单 rank 显存只取决于 `dp_shard` 宽度，跟 `dp_replicate` 无关"。
 
-### 6.4 如果你有真实多卡环境
-
-```bash
-# 纯 FSDP（dp_shard=4）
-NGPU=4 ./scripts/run_deepseek_debug.sh \
-  --parallelism.data_parallel_shard_degree 4
-
-# HSDP：2 组复制 x 每组 2 卡分片
-NGPU=4 ./scripts/run_deepseek_debug.sh \
-  --parallelism.data_parallel_replicate_degree 2 \
-  --parallelism.data_parallel_shard_degree 2
-```
-
-用 [`docs/debugging.md`](../docs/debugging.md) 里的 profiling 工具（`--profiler.enable_memory_snapshot` 做显存 timeline，或 `torch.profiler` trace）抓一次真实 trace，重点看两件事：
-1. **通信 timeline**：All-Gather（前向）/ Reduce-Scatter（反向）是否出现在预期位置（每个 transformer block 前后），以及是否跟相邻层计算**重叠**（理想情况下通信 kernel 应该和计算 kernel 在时间轴上并行，而不是先等通信完再算）。
-2. **显存曲线**：跟 6.2 节单卡 fake_backend 测到的相对趋势做对比——在真实规模模型上，`dp_shard` 翻倍带来的显存降幅应该比这里明显得多。
+如果之后这台机器加卡到 4 张，可以直接跑真实的 `dp_replicate=2 x dp_shard=2`（两个维度都非 1），预期能看到 "CUDA memory usage for model" 降到 `0.04GiB`（跟 `dp_shard=2` 一致）而不是进一步降到 `0.02GiB`——那就是对本节结论最终的真实硬件验证。
 
 ---
 
@@ -259,6 +250,6 @@ NGPU=4 ./scripts/run_deepseek_debug.sh \
 4. `apply_fsdp_to_decoder` 为什么要按 `transformer_block` 这个粒度分别调用 `fully_shard`，而不是对整个模型只调用一次？如果只调用一次会有什么后果？
 5. HSDP 里，单个 rank 的参数显存占用取决于 `dp_replicate` 还是 `dp_shard`？为什么？（提示：结合 6.3 节的实测数据）
 6. DeepSeek V4 的路由专家参数为什么不能直接用 `dp_shard` 分片，而要单独开一个 `efsdp` 轴？`efsdp_ep_size > num_experts` 时分片策略会发生什么变化，为什么？
-7. `COMM_MODE=fake_backend` 能验证什么、不能验证什么？为什么它能在单卡上"跑" `NGPU=128` 的配置？
+7. `COMM_MODE=fake_backend` 能验证什么、不能验证什么？为什么它能在卡数不够的机器上"跑" `NGPU=128` 的配置？
 
 如果这几个问题都能讲清楚，第 1 周的目标就达成了，可以进入 [第 2 周：张量并行 TP](./distributed-training-roadmap.md#第-2-周张量并行-tptensor-parallel)。
